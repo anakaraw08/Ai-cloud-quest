@@ -10,7 +10,14 @@ def build_request(question, max_words=50):
 req = build_request("What is Docker?")
 print(req["question"])
 print(json.dumps(req, indent=2))
-count_words = '{"words": "5", "chars": 27}'
-data = json.loads(count_words)
-print(data["words"], "huh", data["chars"], "chars")
 
+def count_words(text):
+    words = len(text.split())
+    chars = len(text)
+    return {"words": words, "chars": chars}
+result = count_words("Docker packages apps into containers")
+print(json.dumps(result, indent=2))
+
+raw = '{"answer": "A container tool", "tokens": 12}'
+data = json.loads(raw)
+print(data["answer"], "used", data["tokens"], "tokens")
