@@ -1,23 +1,87 @@
-import anthropic
-from anthropic import WorkloadIdentityCredentials
+name: anthropic-wif-test
 
-def read_token() -> str:
-    with open("/path/to/token") as f:
-        return f.read().strip()
+on:
+  push:
+    branches: [main]      # keep in step with the ref your federation rule allows
+  workflow_dispatch:      # adds a "Run workflow" button in the Actions tab for re-tests
 
-client = anthropic.Anthropic(
-    credentials=WorkloadIdentityCredentials(
-        identity_token_provider=read_token,
-        federation_rule_id="fdrl_01GBgBN1XUGbvm4FVNWt47HA",
-        organization_id="a03d7eae-c0c7-4ad3-8fb2-34512da3f928",
-        service_account_id="svac_01RPsuuHLEWKz3yHQ1zH5UDF",
-        workspace_id="wrkspc_01Q3nAfEzfJnGdkTdLhBv4eD",
-    ),
-)
+permissions:
+  id-token: write
+  contents: read
 
-message = client.messages.create(
-    model="claude-sonnet-5-5",
-    max_tokens=1024,
-    messages=[{"role": "user", "content": "Hello, Claude"}],
-)
-print(next(block.text for block in message.content if block.type == "text"))
+jobs:
+  call-claude:
+    runs-on: ubuntu-latest
+    env:
+      # Identifiers, not secrets: the federation rule is what grants access.
+      ANTHROPIC_FEDERATION_RULE_ID: fdrl_01GBgBN1XUGbvm4FVNWt47HA
+      ANTHROPIC_ORGANIZATION_ID: a03d7eae-c0c7-4ad3-8fb2-34512da3f928
+      ANTHROPIC_SERVICE_ACCOUNT_ID: svac_01RPsuuHLEWKz3yHQ1zH5UDF
+      ANTHROPIC_WORKSPACE_ID: wrkspc_01Q3nAfEzfJnGdkTdLhBv4eD
+    defaults:
+      run:
+        shell: bash       # explicit bash = -eo pipefail, so a failure inside a pipe fails the step
+    steps:
+      - name: Fetch GitHub OIDC token
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const token = await core.getIDToken('https://api.anthropic.com');
+            core.setSecret(token);
+            require('fs').writeFileSync('/tmp/gha-jwt', token, { mode: 0o600 });
+
+      - name: Show the claims the federation rule will check
+        run: |
+          # Prints only the JWT payload (no signature), so nothing here is usable as a credential.
+          payload=$(cut -d. -f2 /tmp/gha-jwt | tr '_-' '/+')
+          while [ $(( ${#payload} % 4 )) -ne 0 ]; do payload="${payload}="; done
+          echo "$payload" | base64 -d | jq '{sub, aud, repository, repository_owner, ref, event_name}'
+
+      - name: Exchange for an Anthropic access token
+        run: |
+          jq -n --rawfile jwt /tmp/gha-jwt '{
+            grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            assertion: ($jwt | rtrimstr("\n")),
+            federation_rule_id: env.ANTHROPIC_FEDERATION_RULE_ID,
+            organization_id: env.ANTHROPIC_ORGANIZATION_ID,
+            service_account_id: env.ANTHROPIC_SERVICE_ACCOUNT_ID,
+            workspace_id: env.ANTHROPIC_WORKSPACE_ID
+          }' > /tmp/exchange-req.json
+
+          status=$(curl -sS -o /tmp/exchange-resp.json -w '%{http_code}' \
+            https://api.anthropic.com/v1/oauth/token \
+            -H "content-type: application/json" \
+            --data @/tmp/exchange-req.json)
+          rm -f /tmp/exchange-req.json /tmp/gha-jwt
+
+          jq 'with_entries(if (.key | test("token$")) then .value = "<redacted>" else . end)' /tmp/exchange-resp.json
+
+          if [ "$status" != "200" ]; then
+            echo "::error::Token exchange failed (HTTP $status). See Workload identity > Authentication history in the Claude Console for the deny reason."
+            exit 1
+          fi
+
+          token=$(jq -r '.access_token // empty' /tmp/exchange-resp.json)
+          rm -f /tmp/exchange-resp.json
+          case "$token" in
+            sk-ant-oat01-*) ;;
+            *) echo "::error::HTTP 200 but the response had no sk-ant-oat01- access token"; exit 1 ;;
+          esac
+          echo "::add-mask::$token"
+          echo "ANTHROPIC_ACCESS_TOKEN=$token" >> "$GITHUB_ENV"
+
+      - name: Smoke-test a Claude call with the federated token
+        run: |
+          status=$(curl -sS -o /tmp/msg.json -w '%{http_code}' \
+            https://api.anthropic.com/v1/messages \
+            -H "authorization: Bearer $ANTHROPIC_ACCESS_TOKEN" \
+            -H "anthropic-version: 2026-10-21" \
+            -H "content-type: application/json" \
+            -d '{"model":"claude-haiku-5-5","max_tokens":20,"messages":[{"role":"user","content":"Reply with exactly: WIF OK"}]}')
+
+          if [ "$status" != "200" ]; then
+            jq . /tmp/msg.json || cat /tmp/msg.json
+            echo "::error::Messages API returned HTTP $status with the federated token"
+            exit 1
+          fi
+          echo "Claude says: $(jq -r '[.content[] | select(.type=="text") | .text] | join("")' /tmp/msg.json)"
